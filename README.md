@@ -5,7 +5,7 @@
 A simple connection multiplexing library for Golang.
 
 - KISS (keep it simple stupid).
-- Almost Zero-alloc. Still needs alloc buffers but they will be reused.
+- Almost Zero-alloc. Still needs to allocate buffers, but they will be reused.
 - Small overhead. Data frame has 7 bytes header and can have 65535 bytes payload.
 - Streams can be opened by either client or server.
 - Builtin flow control and rx buffer for each stream. A slow io stream won't affect other streams in the same session.

@@ -11,8 +11,7 @@ import (
 )
 
 const (
-	MaxStreamNum       = 1<<31 - 1
-	defaultPingTimeout = time.Second * 10
+	MaxStreamNum = 1<<31 - 1
 )
 
 var (
@@ -43,9 +42,9 @@ type Opts struct {
 	// ping request to the peer. Zero value means no ping will be sent.
 	PingInterval time.Duration
 
-	// PingTimeout indicates how long will this Session will be closed with
-	// ErrPingTimeout if no further data (not just a pong) was received after a ping
-	// was sent.
+	// PingTimeout indicates how long will this Session be closed with
+	// ErrPingTimeout if no further data (any data, not just a pong) was
+	// received after a ping was sent.
 	// Default is 10s.
 	// If PingTimeout > PingInterval, PingInterval will be used.
 	PingTimeout time.Duration
@@ -482,9 +481,6 @@ func (s *Session) writeLoop() {
 func (s *Session) pingLoop() {
 	interval := s.opts.PingInterval
 	timeout := s.opts.PingTimeout
-	if timeout <= 0 {
-		timeout = defaultPingTimeout
-	}
 	if timeout > interval {
 		timeout = interval
 	}
