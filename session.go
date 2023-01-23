@@ -49,7 +49,7 @@ type Opts struct {
 	// If PingTimeout > PingInterval, PingInterval will be used.
 	PingTimeout time.Duration
 
-	// IdleTimeout indicates how long will this Session will be closed with
+	// IdleTimeout indicates how long will this Session be closed with
 	// ErrIdleTimeout if no data (excluding ping and pong) was transmitted.
 	// Zero value means no idle timeout.
 	IdleTimeout time.Duration
