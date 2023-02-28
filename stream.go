@@ -2,13 +2,14 @@ package mux
 
 import (
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 )
 
 const (
-	MinWindow = 64 * 1024
-	MaxWindow = 1<<32 - 1
+	MinWindow = 64*1024 - 1
+	MaxWindow = 1<<31 - 1
 )
 
 var (
@@ -40,7 +41,6 @@ func newStream(sess *Session, sid int32) *Stream {
 		flowControl: newOutflowControl(),
 		closeNotify: make(chan struct{}),
 	}
-	s.rxWindow.Store(sess.defaultStreamRw)
 	return s
 }
 
@@ -66,34 +66,58 @@ func (s *Stream) ReadBufferSize() int {
 	return s.rb.len()
 }
 
+func (s *Stream) WriteTo(w io.Writer) (int64, error) {
+	var n int64
+	for {
+		f, ok := s.rb.popHeadFrame(s.closeNotify)
+		if !ok {
+			return n, s.closeErr
+		}
+		nw, err := w.Write(f)
+		n += int64(nw)
+		remainWindow := s.rb.consumeHeadFrame(nw)
+		s.adjustWindow(s.rxWindow.Load(), remainWindow)
+		if err != nil {
+			return n, err
+		}
+	}
+}
+
 // SetRxWindowSize sets the stream rx windows size.
 // If n is invalid, the closest limit will be used.
 func (s *Stream) SetRxWindowSize(n uint32) {
 	s.rxWindow.Store(validWindowSize(n))
+	s.adjustWindow(s.rxWindow.Load(), s.rb.currentWindow())
 }
 
 func (s *Stream) read(p []byte) (n int, err error) {
-	n, windowC, ok := s.rb.read(p, s.closeNotify)
+	n, currentWindow, ok := s.rb.read(p, s.closeNotify)
 	if !ok {
 		return n, s.closeErr
 	}
-
-	window := s.rxWindow.Load()
-	minUpdate := window / 8 // avoid dense ack
-
-	// update peer window
-	if ackPending := window - windowC; window > windowC && // avoid negative
-		ackPending >= minUpdate {
-		s.rb.windowInc(ackPending)
-		s.updatePeerWindow(ackPending)
-	}
+	s.adjustWindow(s.rxWindow.Load(), currentWindow)
 	return n, err
 }
 
-func (s *Stream) updatePeerWindow(i uint32) {
+// adjust local and peer window
+func (s *Stream) adjustWindow(target, current uint32) {
+	minUpdate := target / 8 // avoid dense ack
+
+	// update peer window
+	if ackPending := target - current; target > current && // avoid negative
+		ackPending >= minUpdate {
+		s.rb.windowInc(ackPending)
+		s.incPeerWindow(ackPending)
+	}
+}
+
+func (s *Stream) incPeerWindow(i uint32) {
 	// ignore write error.
 	// if session has a write error, it will close this stream anyway.
-	_, _ = s.writeFramePayloadToSess(packWindowUpdateFrame(s.id, i))
+	select {
+	case s.sess.writeOpChan <- writeFrameOp{b: packWindowUpdateFrame(s.id, i).b, releaseB: true}:
+	case <-s.closeNotify:
+	}
 }
 
 // Write implements io.Writer.
@@ -102,53 +126,42 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 }
 
 func (s *Stream) write(p []byte) (n int, err error) {
-	select {
-	case <-s.closeNotify:
-		return n, s.closeErr
-	default:
-	}
-
-	for {
-		frameLen := len(p) - n
-		if frameLen > maxPayloadLength {
-			frameLen = maxPayloadLength
-		}
-		window, ok := s.flowControl.consume(uint32(frameLen), s.closeNotify)
-		if !ok { // stream closed
-			return n, s.closeErr
-		}
-		frameLen = int(window)
-
-		buf := packDataFrame(s.id, p[n:n+frameLen])
-		headerLen := buf.len() - frameLen
-		nw, err := s.writeFramePayloadToSess(buf)
+	for n < len(p) {
+		nw, err := s.writeDataFrameToSess(p[n:])
+		n += nw
 		if err != nil {
-			if nd := nw - headerLen; nd > 0 {
-				n += nd
-			}
 			return n, err
-		}
-		n += frameLen
-		if n == len(p) {
-			break
 		}
 	}
 	return n, nil
 }
 
-func (s *Stream) writeFramePayloadToSess(b allocBuffer) (int, error) {
+// write at most maxPayloadLength bytes of b to session.
+func (s *Stream) writeDataFrameToSess(b []byte) (int, error) {
+	if len(b) > maxPayloadLength {
+		b = b[:maxPayloadLength]
+	}
+
+	// acquire window
+	ready, ok := s.flowControl.consume(uint32(len(b)), s.closeNotify)
+	if !ok { // stream closed
+		return 0, s.closeErr
+	}
+	b = b[:ready]
+
 	rc := getWriteResChan()
+	f := packDataFrame(s.id, b)
+	defer releaseWriteResChan(rc)
+	defer releaseBuffer(f)
 	select {
-	case s.sess.writeOpChan <- writeOp{b: b.b, rc: rc, releaseB: true}:
-		select {
-		case res := <-rc:
-			releaseWriteResChan(rc)
-			return res.n, res.err
-		case <-s.closeNotify:
-			return 0, s.closeErr
+	case s.sess.writeOpChan <- writeFrameOp{b: f.b, rc: rc}:
+		res := <-rc
+		n := res.n - 7 // data frame has 7 bytes header
+		if n < 0 {
+			n = 0
 		}
+		return n, res.err
 	case <-s.closeNotify:
-		releaseWriteResChan(rc)
 		return 0, s.closeErr
 	}
 }
@@ -177,17 +190,21 @@ func (s *Stream) closeWithErr(err error, bySession bool) {
 }
 
 type outflowControl struct {
-	m      sync.Mutex
-	window uint32
-	wakeUp chan struct{}
+	m         sync.Mutex
+	window    uint32
+	incSignal chan struct{}
 }
 
 func newOutflowControl() *outflowControl {
-	wc := &outflowControl{window: MinWindow, wakeUp: make(chan struct{}, 1)}
+	wc := &outflowControl{window: MinWindow, incSignal: make(chan struct{}, 1)}
 	return wc
 }
 
 func (wc *outflowControl) inc(i uint32) bool {
+	if i > MaxWindow { // overflowed already
+		return false
+	}
+
 	wc.m.Lock()
 	nw := wc.window + i
 	if nw > MaxWindow { // overflowed
@@ -196,44 +213,38 @@ func (wc *outflowControl) inc(i uint32) bool {
 	}
 	wc.window = nw
 	wc.m.Unlock()
-	wc.signal()
+	wc.sendIncSignal()
 	return true
 }
 
-func (wc *outflowControl) signal() {
+func (wc *outflowControl) sendIncSignal() {
 	select {
-	case wc.wakeUp <- struct{}{}:
+	case wc.incSignal <- struct{}{}:
 	default:
 	}
 }
 
+// consume tries to consume s window or wait until canceled if no window was available.
+// It's concurrent safe. Multiple consume calls can be waiting on the same outflowControl.
 func (wc *outflowControl) consume(s uint32, cancel <-chan struct{}) (uint32, bool) {
 	wakenUp := false
 consume:
 	wc.m.Lock()
-	if !wakenUp {
-		select { // clear signal
-		case <-wc.wakeUp:
-		default:
-		}
-	}
 	if wc.window >= s { // window is large enough for s.
 		wc.window -= s
 		hasMoreWindow := wc.window > 0
 		wc.m.Unlock()
 		if wakenUp && hasMoreWindow {
-			// wake up another goroutine
-			wc.signal()
+			// There may have more waiting goroutines,
+			// send another signal to wake up another goroutine.
+			// (chain wakeup)
+			wc.sendIncSignal()
 		}
 		return s, true
 	}
 	if wc.window != 0 && wc.window < s { // window is not large enough and is depleted by s
 		consumed := wc.window
 		wc.window = 0
-		select {
-		case <-wc.wakeUp:
-		default:
-		}
 		wc.m.Unlock()
 		return consumed, true
 	}
@@ -241,7 +252,9 @@ consume:
 
 	// window is 0. wait for inc()
 	select {
-	case <-wc.wakeUp:
+	case <-wc.incSignal:
+		// Note: incSignal has buffer, first wakeup
+		// may not have window to consume. (old signal)
 		wakenUp = true
 		goto consume
 	case <-cancel:
@@ -250,54 +263,60 @@ consume:
 }
 
 type rxBuffer struct {
-	m          sync.Mutex
-	pushNotify chan struct{}
-	window     uint32
-	size       int
-	head       *linkBuffer
-	tail       *linkBuffer
-	closed     bool
+	pushSignal chan struct{}
+
+	m      sync.Mutex
+	window uint32
+	size   int
+	head   *linkBuffer
+	tail   *linkBuffer
+	closed bool
 }
 
 func newRxBuffer(window uint32) *rxBuffer {
 	return &rxBuffer{
 		window:     window,
-		pushNotify: make(chan struct{}, 1),
+		pushSignal: make(chan struct{}, 1),
 	}
 }
 
-func (r *rxBuffer) read(p []byte, cancel <-chan struct{}) (n int, window uint32, ok bool) {
-	wakenUp := false
-read:
-	r.m.Lock()
-	if !wakenUp {
-		select {
-		case <-r.pushNotify:
-		default:
-		}
-	}
-
-	// read from buffers
+func (r *rxBuffer) adjustHeadLocked() {
 	for {
 		lb := r.head
 		if lb == nil {
-			break // the whole buffer is empty
+			// no frame
+			return
 		}
 		if lb.read == len(lb.b) {
-			// this link buffer is depleted, next
+			// this frame is depleted
 			next := lb.next
 			releaseLinkBuffer(lb)
 			if next == nil { // end of buffer
 				r.head = nil
 				r.tail = nil
-				break
+				return
 			}
 			r.head = next
-			continue
+			continue // check next frame
 		}
-		nr := copy(p[n:], lb.b[lb.read:])
+		return
+	}
+}
+
+func (r *rxBuffer) read(p []byte, cancel <-chan struct{}) (n int, window uint32, ok bool) {
+read:
+	// read from buffers
+	r.m.Lock()
+	for {
+		r.adjustHeadLocked()
+		if r.head == nil {
+			break // empty buffer
+		}
+
+		f := r.head
+		nr := copy(p[n:], f.b[f.read:])
 		n += nr
-		lb.read += nr
+		f.read += nr
 		r.size -= nr
 		r.window -= uint32(nr)
 		if n == len(p) { // p is full
@@ -313,18 +332,58 @@ read:
 
 	// empty buffer, wait
 	select {
-	case <-r.pushNotify:
-		wakenUp = true
+	case <-r.pushSignal:
+		// Note: pushSignal has buffer, first signal
+		// may not be old. It's ok.
 		goto read
 	case <-cancel:
 		return 0, 0, false
 	}
 }
 
+func (r *rxBuffer) popHeadFrame(cancel <-chan struct{}) ([]byte, bool) {
+read:
+	// read from buffers
+	r.m.Lock()
+	r.adjustHeadLocked()
+	if f := r.head; f != nil {
+		b := f.b[f.read:]
+		r.m.Unlock()
+		return b, true
+	}
+	r.m.Unlock()
+
+	// empty buffer, wait
+	select {
+	case <-r.pushSignal:
+		goto read
+	case <-cancel:
+		return nil, false
+	}
+}
+
+// mark how many bytes were consumed in the head frame.
+// Should be used with popHeadFrame.
+func (r *rxBuffer) consumeHeadFrame(i int) uint32 {
+	r.m.Lock()
+	r.head.read += i
+	r.size -= i
+	r.window -= uint32(i)
+	w := r.window
+	r.m.Unlock()
+	return w
+}
+
 func (r *rxBuffer) windowInc(i uint32) {
 	r.m.Lock()
 	defer r.m.Unlock()
 	r.window += i
+}
+
+func (r *rxBuffer) currentWindow() uint32 {
+	r.m.Lock()
+	defer r.m.Unlock()
+	return r.window
 }
 
 // pushBuffer takes control of ab if it returns false, false
@@ -352,12 +411,12 @@ func (r *rxBuffer) pushBuffer(ab allocBuffer) (overflowed bool, closed bool) {
 		r.tail.next = lb
 		r.tail = lb
 	}
+	r.m.Unlock()
 
 	select {
-	case r.pushNotify <- struct{}{}:
+	case r.pushSignal <- struct{}{}:
 	default:
 	}
-	r.m.Unlock()
 	return false, false
 }
 

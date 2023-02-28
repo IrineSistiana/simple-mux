@@ -66,10 +66,10 @@ type Session struct {
 	pingReadMark atomic.Bool // for fast ping check
 
 	// write loop
-	// Once the writeOp was sent to the writeOpChan,
+	// Once the writeFrameOp was sent to the writeOpChan,
 	// c.Write will be called and the result will be
-	// sent back by writeOp.rc.
-	writeOpChan chan writeOp
+	// sent back by writeFrameOp.rc.
+	writeOpChan chan writeFrameOp
 
 	tm               sync.Mutex  // protect the following fields
 	idleTimer        *time.Timer // nil if no idle timeout
@@ -86,14 +86,13 @@ type Session struct {
 	streams    map[int32]*Stream // negative id is opened by peer
 }
 
-type writeOp struct {
-	// b is the payload to write.
+type writeFrameOp struct {
 	b []byte
 	// rc is the chan to receive write result.
-	// If set, it must not block (must have at least one buf)
+	// If set, it must not block (should have at least one buf)
 	rc chan writeRes
 	// If keepIdle, session won't reset its idle timer.
-	// (e.g. PING cmd)
+	// (e.g. this is a PING frame)
 	keepIdle bool
 	// Indicate b is an alloc buffer and should be released.
 	releaseB bool
@@ -108,8 +107,8 @@ func NewSession(c io.ReadWriteCloser, opts Opts) *Session {
 		c:               c,
 		opts:            opts,
 		defaultStreamRw: validWindowSize(opts.StreamReceiveWindow),
-		acceptedChan:    make(chan *Stream),
-		writeOpChan:     make(chan writeOp),
+		acceptedChan:    make(chan *Stream, 1),
+		writeOpChan:     make(chan writeFrameOp),
 		closeNotify:     make(chan struct{}),
 		streams:         make(map[int32]*Stream),
 	}
@@ -151,23 +150,20 @@ func (s *Session) OpenStream() (*Stream, error) {
 		s.m.Unlock()
 		return nil, ErrStreamIdOverFlowed
 	}
-	s.m.Unlock()
-
-	// send SYN and the first window update (if needed)
-	var b allocBuffer
-	if delta := s.defaultStreamRw - MinWindow; delta > 0 {
-		b = packSynFrameWithWindowUpdate(sid, delta)
-	} else {
-		b = packSynFrame(sid)
-	}
-	if err := s.sendFrameBuf(b, false); err != nil {
-		return nil, err
-	}
-
-	s.m.Lock()
 	stream := newStream(s, sid)
 	s.streams[sid] = stream
 	s.m.Unlock()
+
+	// send SYN and the first window update (if needed)
+	if err := s.sendFrameBuf(packSynFrame(sid), false); err != nil {
+		s.m.Lock()
+		delete(s.streams, sid)
+		s.m.Unlock()
+		stream.closeWithErr(err, true)
+		return nil, err
+	}
+	stream.SetRxWindowSize(s.defaultStreamRw)
+
 	return stream, nil
 }
 
@@ -333,20 +329,22 @@ func (s *Session) handleSYN(r io.Reader) error {
 		return ErrInvalidSID
 	}
 
-	s.m.Lock()
 	sm := newStream(s, sid)
+	s.m.Lock()
+	_, dup := s.streams[sid]
+	if dup { // duplicated sid
+		s.m.Unlock()
+		sm.closeWithErr(ErrInvalidSID, true)
+		return ErrInvalidSID
+	}
 	s.streams[sid] = sm
 	s.m.Unlock()
+	sm.SetRxWindowSize(s.defaultStreamRw)
 
 	select {
 	case s.acceptedChan <- sm:
 	case <-s.closeNotify:
 		return s.closeErr
-	}
-
-	// update peer window
-	if delta := s.defaultStreamRw - MinWindow; delta > 0 {
-		_ = s.sendFrameBuf(packWindowUpdateFrame(sid, delta), false)
 	}
 
 	return nil
@@ -558,7 +556,7 @@ func (s *Session) stopIdleTimer() {
 func (s *Session) sendFrameBuf(b allocBuffer, keepIdle bool) error {
 	rc := getWriteResChan()
 	select {
-	case s.writeOpChan <- writeOp{b: b.b, rc: rc, keepIdle: keepIdle, releaseB: true}:
+	case s.writeOpChan <- writeFrameOp{b: b.b, rc: rc, keepIdle: keepIdle, releaseB: true}:
 		select {
 		case res := <-rc:
 			releaseWriteResChan(rc)

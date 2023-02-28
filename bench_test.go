@@ -87,6 +87,7 @@ func Benchmark_Mux_Concurrent_IO_Through_Single_TCP(b *testing.B) {
 	var read atomic.Int64
 
 	wb := make([]byte, blockSize)
+
 	b.RunParallel(func(pb *testing.PB) {
 		go func() {
 			sm, err := c.OpenStream()
@@ -111,7 +112,7 @@ func Benchmark_Mux_Concurrent_IO_Through_Single_TCP(b *testing.B) {
 		defer alloc.Release(buf)
 
 		n, err := io.CopyBuffer(io.Discard, sm, buf)
-		if err != nil {
+		if err != nil && err != io.EOF {
 			b.Error(err)
 		}
 		read.Add(n)

@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"bytes"
 	"github.com/stretchr/testify/assert"
 	"io"
 	"math/rand"
@@ -40,6 +41,7 @@ func pipe() (c *Session, s *Session, err error) {
 	if sr.err != nil {
 		return nil, nil, sr.err
 	}
+
 	c = NewSession(cr.c, Opts{})
 	s = NewSession(sr.c, Opts{
 		AllowAccept: true,
@@ -59,7 +61,7 @@ func Test_Mux_IO(t *testing.T) {
 	}
 
 	wg := new(sync.WaitGroup)
-	for i := 0; i < 1; i++ {
+	for i := 0; i < 16; i++ { // concurrent 16 streams
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -69,8 +71,10 @@ func Test_Mux_IO(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				sm.SetRxWindowSize(1024 * 1024)
+				sm.SetRxWindowSize(1024 * 1024) // trigger a window update
 				sm.SetRxWindowSize(64 * 1024)
+
+				// test read
 				buf := make([]byte, len(junk))
 				_, err = io.ReadFull(sm, buf)
 				if err != nil {
@@ -86,6 +90,7 @@ func Test_Mux_IO(t *testing.T) {
 				}
 				_ = sm.Close()
 			}()
+
 			sm, err := s.Accept()
 			if err != nil {
 				t.Error(err)
@@ -96,8 +101,12 @@ func Test_Mux_IO(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			got, err := io.ReadAll(sm)
-			if err != nil {
+
+			// test WriteTo
+			buf := new(bytes.Buffer)
+			_, err = sm.WriteTo(buf)
+			got := buf.Bytes()
+			if err != nil && err != io.EOF {
 				t.Error(err)
 				return
 			}

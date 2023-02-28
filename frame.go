@@ -10,6 +10,7 @@ import (
 type frameType uint8
 
 const (
+	headerLength     = 7
 	maxPayloadLength = math.MaxUint16
 
 	frameTypeInvalid frameType = 0
