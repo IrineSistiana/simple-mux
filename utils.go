@@ -3,6 +3,8 @@ package mux
 import (
 	"github.com/urlesistiana/alloc-go"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // buffer from alloc and should be released manually
@@ -62,4 +64,31 @@ func validWindowSize(i uint32) uint32 {
 		i = MaxWindow
 	}
 	return i
+}
+
+type idleTimer struct {
+	d    time.Duration
+	t    *time.Timer
+	noop atomic.Bool
+}
+
+func newIdleTimer(d time.Duration, f func()) *idleTimer {
+	return &idleTimer{
+		d: d,
+		t: time.AfterFunc(d, f),
+	}
+}
+
+func (t *idleTimer) reset() {
+	if t.noop.CompareAndSwap(false, true) {
+		if !t.t.Reset(t.d) { // timer was fired, but we re-activated it.
+			t.t.Stop()
+			return // leave noop to true
+		}
+		t.noop.Store(false)
+	}
+}
+
+func (t *idleTimer) stop() {
+	t.t.Stop()
 }

@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"github.com/urlesistiana/alloc-go"
@@ -56,9 +57,8 @@ type Opts struct {
 }
 
 type Session struct {
-	c               io.ReadWriteCloser
-	opts            Opts
-	defaultStreamRw uint32 // default stream rx window size. valid.
+	c    io.ReadWriteCloser
+	opts Opts
 
 	acceptedChan chan *Stream
 
@@ -71,9 +71,7 @@ type Session struct {
 	// sent back by writeFrameOp.rc.
 	writeOpChan chan writeFrameOp
 
-	tm               sync.Mutex  // protect the following fields
-	idleTimer        *time.Timer // nil if no idle timeout
-	idleTimerStopped bool
+	idleTimer *idleTimer // May be nil if idle timeout was not set.
 
 	closeNotify chan struct{}
 	closeErr    error // valid after closeNotify was closed.
@@ -104,17 +102,16 @@ type writeRes struct {
 
 func NewSession(c io.ReadWriteCloser, opts Opts) *Session {
 	s := &Session{
-		c:               c,
-		opts:            opts,
-		defaultStreamRw: validWindowSize(opts.StreamReceiveWindow),
-		acceptedChan:    make(chan *Stream, 1),
-		writeOpChan:     make(chan writeFrameOp),
-		closeNotify:     make(chan struct{}),
-		streams:         make(map[int32]*Stream),
+		c:            c,
+		opts:         opts,
+		acceptedChan: make(chan *Stream, 1),
+		writeOpChan:  make(chan writeFrameOp),
+		closeNotify:  make(chan struct{}),
+		streams:      make(map[int32]*Stream),
 	}
 
-	if idleTimeout := opts.IdleTimeout; idleTimeout > 0 {
-		s.idleTimer = time.AfterFunc(idleTimeout, func() {
+	if t := opts.IdleTimeout; t > 0 {
+		s.idleTimer = newIdleTimer(t, func() {
 			s.closeWithErr(ErrIdleTimeout)
 		})
 	}
@@ -162,7 +159,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 		stream.closeWithErr(err, true)
 		return nil, err
 	}
-	stream.SetRxWindowSize(s.defaultStreamRw)
+	stream.SetRxWindowSize(validWindowSize(s.opts.StreamReceiveWindow))
 
 	return stream, nil
 }
@@ -232,8 +229,6 @@ func (s *Session) closeWithErr(err error) {
 		err = ErrClosedSession
 	}
 
-	s.stopIdleTimer()
-
 	s.m.Lock()
 	defer s.m.Unlock()
 	if s.closed.Load() {
@@ -243,6 +238,10 @@ func (s *Session) closeWithErr(err error) {
 	s.closeErr = err
 	close(s.closeNotify)
 	_ = s.c.Close()
+
+	if s.idleTimer != nil {
+		s.idleTimer.stop()
+	}
 
 	for _, stream := range s.streams {
 		stream.closeWithErr(err, true)
@@ -256,8 +255,9 @@ func (r readFunc) Read(p []byte) (n int, err error) {
 }
 
 func (s *Session) readLoop() {
+	br := bufio.NewReaderSize(s.c, 128)
 	var r readFunc = func(b []byte) (int, error) {
-		n, err := s.c.Read(b)
+		n, err := br.Read(b)
 		if n > 0 {
 			s.pingReadMark.Store(true)
 		}
@@ -308,8 +308,8 @@ func (s *Session) readLoop() {
 			return
 		}
 
-		if !keepIdle {
-			s.resetIdleTimer()
+		if !keepIdle && s.idleTimer != nil {
+			s.idleTimer.reset()
 		}
 	}
 }
@@ -339,7 +339,7 @@ func (s *Session) handleSYN(r io.Reader) error {
 	}
 	s.streams[sid] = sm
 	s.m.Unlock()
-	sm.SetRxWindowSize(s.defaultStreamRw)
+	sm.SetRxWindowSize(validWindowSize(s.opts.StreamReceiveWindow))
 
 	select {
 	case s.acceptedChan <- sm:
@@ -467,8 +467,8 @@ func (s *Session) writeLoop() {
 				s.closeWithErr(fmt.Errorf("write loop exited: %w", err))
 				return
 			}
-			if !op.keepIdle {
-				s.resetIdleTimer()
+			if !op.keepIdle && s.idleTimer != nil {
+				s.idleTimer.reset()
 			}
 		case <-s.closeNotify:
 			return
@@ -521,61 +521,23 @@ func (s *Session) pingLoop() {
 	}
 }
 
-func (s *Session) resetIdleTimer() {
-	if s.idleTimer == nil {
-		return
-	}
-
-	s.tm.Lock()
-	defer s.tm.Unlock()
-	if s.idleTimerStopped {
-		return
-	}
-	if !s.idleTimer.Reset(s.opts.IdleTimeout) {
-		s.idleTimer.Stop()
-		s.idleTimerStopped = true
-	}
-}
-
-func (s *Session) stopIdleTimer() {
-	if s.idleTimer == nil {
-		return
-	}
-
-	s.tm.Lock()
-	defer s.tm.Unlock()
-	if s.idleTimerStopped {
-		return
-	}
-	s.idleTimer.Stop()
-	s.idleTimerStopped = true
-}
-
 // sendFrameBuf takes control of the b. If keepIdle, Session idle timer won't
 // be reset. (e.g. ping)
 func (s *Session) sendFrameBuf(b allocBuffer, keepIdle bool) error {
 	rc := getWriteResChan()
+	defer releaseWriteResChan(rc)
+
 	select {
 	case s.writeOpChan <- writeFrameOp{b: b.b, rc: rc, keepIdle: keepIdle, releaseB: true}:
-		select {
-		case res := <-rc:
-			releaseWriteResChan(rc)
-			if res.err != nil {
-				return res.err
-			}
-		case <-s.closeNotify:
-			// it's not safe to release rc here.
-			// It may still be accessed by writeLoop.
-			// We let it leak to the GC, that's ok.
-			return s.closeErr
-		}
-		return nil
+		res := <-rc
+		return res.err
 	case <-s.closeNotify:
-		releaseWriteResChan(rc)
 		return s.closeErr
 	}
 }
 
+// streamCloseNotify must only be called by a stream that belongs to s when
+// the stream is closing not by the session (e.g. user)
 func (s *Session) streamCloseNotify(sid int32) {
 	var sendFin2Peer bool
 	s.m.Lock()

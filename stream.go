@@ -4,7 +4,6 @@ import (
 	"errors"
 	"io"
 	"sync"
-	"sync/atomic"
 )
 
 const (
@@ -22,8 +21,7 @@ type Stream struct {
 	sess *Session
 
 	// read
-	rb       *rxBuffer
-	rxWindow atomic.Uint32
+	rb *rxBuffer
 
 	// write
 	flowControl *outflowControl
@@ -37,7 +35,7 @@ func newStream(sess *Session, sid int32) *Stream {
 	s := &Stream{
 		id:          sid,
 		sess:        sess,
-		rb:          newRxBuffer(sess.defaultStreamRw),
+		rb:          newRxBuffer(MinWindow),
 		flowControl: newOutflowControl(),
 		closeNotify: make(chan struct{}),
 	}
@@ -75,8 +73,10 @@ func (s *Stream) WriteTo(w io.Writer) (int64, error) {
 		}
 		nw, err := w.Write(f)
 		n += int64(nw)
-		remainWindow := s.rb.consumeHeadFrame(nw)
-		s.adjustWindow(s.rxWindow.Load(), remainWindow)
+		updatePeerWindow := s.rb.consumeHeadFrame(nw)
+		if updatePeerWindow > 0 {
+			s.sendWindowUpdateToPeer(updatePeerWindow)
+		}
 		if err != nil {
 			return n, err
 		}
@@ -86,32 +86,24 @@ func (s *Stream) WriteTo(w io.Writer) (int64, error) {
 // SetRxWindowSize sets the stream rx windows size.
 // If n is invalid, the closest limit will be used.
 func (s *Stream) SetRxWindowSize(n uint32) {
-	s.rxWindow.Store(validWindowSize(n))
-	s.adjustWindow(s.rxWindow.Load(), s.rb.currentWindow())
+	updatePeerWindow := s.rb.setWindow(validWindowSize(n))
+	if updatePeerWindow > 0 {
+		s.sendWindowUpdateToPeer(updatePeerWindow)
+	}
 }
 
 func (s *Stream) read(p []byte) (n int, err error) {
-	n, currentWindow, ok := s.rb.read(p, s.closeNotify)
+	n, updatePeerWindow, ok := s.rb.read(p, s.closeNotify)
 	if !ok {
 		return n, s.closeErr
 	}
-	s.adjustWindow(s.rxWindow.Load(), currentWindow)
+	if updatePeerWindow > 0 {
+		s.sendWindowUpdateToPeer(updatePeerWindow)
+	}
 	return n, err
 }
 
-// adjust local and peer window
-func (s *Stream) adjustWindow(target, current uint32) {
-	minUpdate := target / 8 // avoid dense ack
-
-	// update peer window
-	if ackPending := target - current; target > current && // avoid negative
-		ackPending >= minUpdate {
-		s.rb.windowInc(ackPending)
-		s.incPeerWindow(ackPending)
-	}
-}
-
-func (s *Stream) incPeerWindow(i uint32) {
+func (s *Stream) sendWindowUpdateToPeer(i uint32) {
 	// ignore write error.
 	// if session has a write error, it will close this stream anyway.
 	select {
@@ -265,18 +257,20 @@ consume:
 type rxBuffer struct {
 	pushSignal chan struct{}
 
-	m      sync.Mutex
-	window uint32
-	size   int
-	head   *linkBuffer
-	tail   *linkBuffer
-	closed bool
+	m                 sync.Mutex
+	windowUserDefined uint32
+	windowRemain      uint32
+	bufSize           int
+	head              *linkBuffer
+	tail              *linkBuffer
+	closed            bool
 }
 
-func newRxBuffer(window uint32) *rxBuffer {
+func newRxBuffer(b uint32) *rxBuffer {
 	return &rxBuffer{
-		window:     window,
-		pushSignal: make(chan struct{}, 1),
+		windowUserDefined: b,
+		windowRemain:      b,
+		pushSignal:        make(chan struct{}, 1),
 	}
 }
 
@@ -303,7 +297,20 @@ func (r *rxBuffer) adjustHeadLocked() {
 	}
 }
 
-func (r *rxBuffer) read(p []byte, cancel <-chan struct{}) (n int, window uint32, ok bool) {
+// To avoid dense ack. We only send update frame after every 1/8 window data was read.
+func (r *rxBuffer) needUpdatePeerWindowLocked() uint32 {
+	// calculate window ack size
+	if r.windowUserDefined > r.windowRemain { // Avoid overflow when rb is shrinking.
+		// To avoid dense ack. We only send update frame after every 1/8 window data was read.
+		if awaitingAck := r.windowUserDefined - r.windowRemain; awaitingAck > r.windowUserDefined/8 {
+			r.windowRemain = r.windowUserDefined
+			return awaitingAck
+		}
+	}
+	return 0
+}
+
+func (r *rxBuffer) read(p []byte, cancel <-chan struct{}) (n int, updatePeerWindow uint32, ok bool) {
 read:
 	// read from buffers
 	r.m.Lock()
@@ -317,17 +324,17 @@ read:
 		nr := copy(p[n:], f.b[f.read:])
 		n += nr
 		f.read += nr
-		r.size -= nr
-		r.window -= uint32(nr)
+		r.bufSize -= nr
+		r.windowRemain -= uint32(nr)
 		if n == len(p) { // p is full
 			break
 		}
 	}
-	window = r.window
+	updatePeerWindow = r.needUpdatePeerWindowLocked()
 	r.m.Unlock()
 
 	if n > 0 { // return what have been read.
-		return n, window, true
+		return n, updatePeerWindow, true
 	}
 
 	// empty buffer, wait
@@ -362,28 +369,34 @@ read:
 	}
 }
 
-// mark how many bytes were consumed in the head frame.
-// Should be used with popHeadFrame.
-func (r *rxBuffer) consumeHeadFrame(i int) uint32 {
+// mark how many bytes were consumed in the head frame. It returns the update window size that
+// needs to be sent to peer.
+// It should be used with popHeadFrame.
+// updatePeerWindow may be 0 if it was too small. See rxBuffer.needUpdatePeerWindowLocked().
+func (r *rxBuffer) consumeHeadFrame(i int) (updatePeerWindow uint32) {
 	r.m.Lock()
 	r.head.read += i
-	r.size -= i
-	r.window -= uint32(i)
-	w := r.window
+	r.bufSize -= i
+	r.windowRemain -= uint32(i)
+	updatePeerWindow = r.needUpdatePeerWindowLocked()
 	r.m.Unlock()
-	return w
+	return updatePeerWindow
 }
 
-func (r *rxBuffer) windowInc(i uint32) {
+// setWindow set current receive window size to w, returns the update window size that
+// needs to be sent to peer.
+// updatePeerWindow may be 0 if it was too small. See rxBuffer.needUpdatePeerWindowLocked().
+func (r *rxBuffer) setWindow(w uint32) (updatePeerWindow uint32) {
 	r.m.Lock()
 	defer r.m.Unlock()
-	r.window += i
+	r.windowUserDefined = w
+	return r.needUpdatePeerWindowLocked()
 }
 
 func (r *rxBuffer) currentWindow() uint32 {
 	r.m.Lock()
 	defer r.m.Unlock()
-	return r.window
+	return r.windowRemain
 }
 
 // pushBuffer takes control of ab if it returns false, false
@@ -395,11 +408,11 @@ func (r *rxBuffer) pushBuffer(ab allocBuffer) (overflowed bool, closed bool) {
 		r.m.Unlock()
 		return false, true
 	}
-	if bufSize := r.size + len(b); bufSize > int(r.window) {
+	if bufSize := r.bufSize + len(b); bufSize > int(r.windowRemain) {
 		r.m.Unlock()
 		return true, false
 	} else {
-		r.size = bufSize
+		r.bufSize = bufSize
 	}
 
 	lb := getLinkBuffer()
@@ -423,7 +436,7 @@ func (r *rxBuffer) pushBuffer(ab allocBuffer) (overflowed bool, closed bool) {
 func (r *rxBuffer) len() (n int) {
 	r.m.Lock()
 	defer r.m.Unlock()
-	return r.size
+	return r.bufSize
 }
 
 // close closes rxBuffer and prevent further pushBuffer calls.

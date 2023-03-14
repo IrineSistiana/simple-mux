@@ -10,7 +10,6 @@ import (
 type frameType uint8
 
 const (
-	headerLength     = 7
 	maxPayloadLength = math.MaxUint16
 
 	frameTypeInvalid frameType = 0
@@ -49,16 +48,6 @@ func packSynFinFrame(t frameType, sid int32) allocBuffer {
 
 func packSynFrame(sid int32) allocBuffer {
 	return packSynFinFrame(frameTypeSYN, sid)
-}
-
-func packSynFrameWithWindowUpdate(sid int32, windowUpdate uint32) allocBuffer {
-	b := alloc.Get(1 + 4 + 1 + 4 + 4)
-	b[0] = byte(frameTypeSYN)
-	binary.BigEndian.PutUint32(b[1:5], uint32(sid))
-	b[5] = byte(frameTypeWindowsUpdate)
-	binary.BigEndian.PutUint32(b[6:10], uint32(sid))
-	binary.BigEndian.PutUint32(b[10:14], windowUpdate)
-	return allocBuffer{b: b}
 }
 
 func packFinFrame(sid int32) allocBuffer {
