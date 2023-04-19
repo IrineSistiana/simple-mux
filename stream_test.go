@@ -3,12 +3,13 @@ package mux
 import (
 	"bytes"
 	"context"
-	"github.com/stretchr/testify/assert"
-	"github.com/urlesistiana/alloc-go"
 	"io"
 	"sync"
 	"testing"
 	"time"
+
+	bytesPool "github.com/IrineSistiana/go-bytes-pool"
+	"github.com/stretchr/testify/assert"
 )
 
 func Test_windowControl(t *testing.T) {
@@ -67,10 +68,10 @@ func Test_readBuffer(t *testing.T) {
 		writeData := make([]byte, 0)
 		go func() {
 			for i := 0; i < 128; i++ {
-				p := alloc.Get(1)
-				p[0] = byte(i)
-				writeData = append(writeData, p...)
-				overflowed, closed := b.pushBuffer(allocBuffer{p})
+				p := bytesPool.Get(1)
+				(*p)[0] = byte(i)
+				writeData = append(writeData, *p...)
+				overflowed, closed := b.pushBuffer(p)
 				if !a.False(overflowed) || !a.False(closed) {
 					return
 				}
@@ -82,31 +83,30 @@ func Test_readBuffer(t *testing.T) {
 		var reader readFunc = func(p []byte) (n int, err error) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			n, windowC, ok := b.read(p, ctx.Done())
+			n, _, ok := b.read(p, ctx.Done())
 			rbn += n
 			if !ok {
 				err = ctx.Err()
 			}
-			a.Equal(uint32(len(rb)-rbn), windowC)
 			return n, err
 		}
 		_, err := io.ReadFull(reader, rb)
 		a.Nil(err)
-		a.True(bytes.Equal(writeData, rb))
+		a.True(bytes.Equal(writeData, rb), "data inconsistent")
 	})
 
 	t.Run("overflow and closed", func(t *testing.T) {
 		a := assert.New(t)
 		b := newRxBuffer(16)
-		overflowed, closed := b.pushBuffer(getBuffer(16))
+		overflowed, closed := b.pushBuffer(bytesPool.Get(16))
 		a.False(overflowed)
 		a.False(closed)
-		overflowed, closed = b.pushBuffer(getBuffer(1))
+		overflowed, closed = b.pushBuffer(bytesPool.Get(1))
 		a.True(overflowed)
 		a.False(closed)
 
 		b.close()
-		overflowed, closed = b.pushBuffer(getBuffer(1))
+		overflowed, closed = b.pushBuffer(bytesPool.Get(16))
 		a.False(overflowed)
 		a.True(closed)
 	})

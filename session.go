@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/urlesistiana/alloc-go"
 	"io"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 )
 
 const (
@@ -85,14 +86,14 @@ type Session struct {
 }
 
 type writeFrameOp struct {
-	b []byte
+	b *[]byte
 	// rc is the chan to receive write result.
 	// If set, it must not block (should have at least one buf)
 	rc chan writeRes
 	// If keepIdle, session won't reset its idle timer.
 	// (e.g. this is a PING frame)
 	keepIdle bool
-	// Indicate b is an alloc buffer and should be released.
+	// Indicate b is an buffer from bytesPool and should be released.
 	releaseB bool
 }
 type writeRes struct {
@@ -380,35 +381,35 @@ func (s *Session) handleDataFrame(r io.Reader) error {
 	}
 	sid = -sid
 
-	b := alloc.Get(int(l))
+	b := bytesPool.Get(int(l))
 	n := 0
 	for n < int(l) {
-		nr, err := r.Read(b[n:])
+		nr, err := r.Read((*b)[n:])
 		if nr > 0 {
 			if int(l) == nr { // full read
-				return s.pushData(sid, allocBuffer{b: b})
+				return s.pushData(sid, b)
 			}
 			// partial frame read
 			// push what we have read to the stream asap for lower latency
-			fragment := alloc.Get(nr)
-			copy(fragment, b[n:])
-			if err := s.pushData(sid, allocBuffer{b: fragment}); err != nil {
-				alloc.Release(b)
+			fragment := bytesPool.Get(nr)
+			copy(*fragment, (*b)[n:])
+			if err := s.pushData(sid, fragment); err != nil {
+				bytesPool.Release(b)
 				return err
 			}
 		}
 		if err != nil {
-			alloc.Release(b)
+			bytesPool.Release(b)
 			return err
 		}
 		n += nr
 	}
-	alloc.Release(b)
+	bytesPool.Release(b)
 	return nil
 }
 
 // pushData will take b's ownership.
-func (s *Session) pushData(sid int32, b allocBuffer) error {
+func (s *Session) pushData(sid int32, b *[]byte) error {
 	s.m.RLock()
 	sm := s.streams[sid]
 	s.m.RUnlock()
@@ -418,7 +419,7 @@ func (s *Session) pushData(sid int32, b allocBuffer) error {
 
 	overflowed, closed := sm.rb.pushBuffer(b)
 	if overflowed || closed {
-		releaseBuffer(b)
+		bytesPool.Release(b)
 		if overflowed {
 			return ErrFlowWindowOverflow // receive window overflowed is a protocol error
 		}
@@ -452,7 +453,7 @@ func (s *Session) writeLoop() {
 	for {
 		select {
 		case op := <-s.writeOpChan:
-			n, err := s.c.Write(op.b)
+			n, err := s.c.Write(*op.b)
 			if rc := op.rc; rc != nil {
 				select {
 				case rc <- writeRes{n: n, err: err}:
@@ -461,7 +462,7 @@ func (s *Session) writeLoop() {
 				}
 			}
 			if op.releaseB {
-				alloc.Release(op.b)
+				bytesPool.Release(op.b)
 			}
 			if err != nil {
 				s.closeWithErr(fmt.Errorf("write loop exited: %w", err))
@@ -523,12 +524,12 @@ func (s *Session) pingLoop() {
 
 // sendFrameBuf takes control of the b. If keepIdle, Session idle timer won't
 // be reset. (e.g. ping)
-func (s *Session) sendFrameBuf(b allocBuffer, keepIdle bool) error {
+func (s *Session) sendFrameBuf(b *[]byte, keepIdle bool) error {
 	rc := getWriteResChan()
 	defer releaseWriteResChan(rc)
 
 	select {
-	case s.writeOpChan <- writeFrameOp{b: b.b, rc: rc, keepIdle: keepIdle, releaseB: true}:
+	case s.writeOpChan <- writeFrameOp{b: b, rc: rc, keepIdle: keepIdle, releaseB: true}:
 		res := <-rc
 		return res.err
 	case <-s.closeNotify:

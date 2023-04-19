@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io"
 	"sync"
+
+	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 )
 
 const (
@@ -107,7 +109,7 @@ func (s *Stream) sendWindowUpdateToPeer(i uint32) {
 	// ignore write error.
 	// if session has a write error, it will close this stream anyway.
 	select {
-	case s.sess.writeOpChan <- writeFrameOp{b: packWindowUpdateFrame(s.id, i).b, releaseB: true}:
+	case s.sess.writeOpChan <- writeFrameOp{b: packWindowUpdateFrame(s.id, i), releaseB: true}:
 	case <-s.closeNotify:
 	}
 }
@@ -144,9 +146,9 @@ func (s *Stream) writeDataFrameToSess(b []byte) (int, error) {
 	rc := getWriteResChan()
 	f := packDataFrame(s.id, b)
 	defer releaseWriteResChan(rc)
-	defer releaseBuffer(f)
+	defer bytesPool.Release(f)
 	select {
-	case s.sess.writeOpChan <- writeFrameOp{b: f.b, rc: rc}:
+	case s.sess.writeOpChan <- writeFrameOp{b: f, rc: rc}:
 		res := <-rc
 		n := res.n - 7 // data frame has 7 bytes header
 		if n < 0 {
@@ -281,7 +283,7 @@ func (r *rxBuffer) adjustHeadLocked() {
 			// no frame
 			return
 		}
-		if lb.read == len(lb.b) {
+		if lb.read == len(*lb.bp) {
 			// this frame is depleted
 			next := lb.next
 			releaseLinkBuffer(lb)
@@ -321,7 +323,7 @@ read:
 		}
 
 		f := r.head
-		nr := copy(p[n:], f.b[f.read:])
+		nr := copy(p[n:], (*f.bp)[f.read:])
 		n += nr
 		f.read += nr
 		r.bufSize -= nr
@@ -354,7 +356,7 @@ read:
 	r.m.Lock()
 	r.adjustHeadLocked()
 	if f := r.head; f != nil {
-		b := f.b[f.read:]
+		b := (*f.bp)[f.read:]
 		r.m.Unlock()
 		return b, true
 	}
@@ -400,15 +402,13 @@ func (r *rxBuffer) currentWindow() uint32 {
 }
 
 // pushBuffer takes control of ab if it returns false, false
-func (r *rxBuffer) pushBuffer(ab allocBuffer) (overflowed bool, closed bool) {
-	b := ab.b
-
+func (r *rxBuffer) pushBuffer(b *[]byte) (overflowed bool, closed bool) {
 	r.m.Lock()
 	if r.closed {
 		r.m.Unlock()
 		return false, true
 	}
-	if bufSize := r.bufSize + len(b); bufSize > int(r.windowRemain) {
+	if bufSize := r.bufSize + len(*b); bufSize > int(r.windowRemain) {
 		r.m.Unlock()
 		return true, false
 	} else {
@@ -416,7 +416,7 @@ func (r *rxBuffer) pushBuffer(ab allocBuffer) (overflowed bool, closed bool) {
 	}
 
 	lb := getLinkBuffer()
-	lb.b = b
+	lb.bp = b
 	if r.tail == nil {
 		r.head = lb
 		r.tail = lb
@@ -445,10 +445,4 @@ func (r *rxBuffer) close() {
 	r.m.Lock()
 	defer r.m.Unlock()
 	r.closed = true
-}
-
-type linkBuffer struct {
-	b    []byte // from alloc
-	read int
-	next *linkBuffer
 }

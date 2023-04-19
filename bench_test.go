@@ -1,7 +1,6 @@
 package mux
 
 import (
-	"github.com/urlesistiana/alloc-go"
 	"io"
 	"math/rand"
 	"net"
@@ -9,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 )
 
 type discardWriterCloser struct {
@@ -108,10 +109,10 @@ func Benchmark_Mux_Concurrent_IO_Through_Single_TCP(b *testing.B) {
 			b.Error(err)
 			return
 		}
-		buf := alloc.Get(16 * 1024)
-		defer alloc.Release(buf)
+		buf := bytesPool.Get(16 * 1024)
+		defer bytesPool.Release(buf)
 
-		n, err := io.CopyBuffer(io.Discard, sm, buf)
+		n, err := io.CopyBuffer(io.Discard, sm, *buf)
 		if err != nil && err != io.EOF {
 			b.Error(err)
 		}

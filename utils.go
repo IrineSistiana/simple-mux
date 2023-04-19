@@ -1,28 +1,12 @@
 package mux
 
 import (
-	"github.com/urlesistiana/alloc-go"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 )
-
-// buffer from alloc and should be released manually
-type allocBuffer struct {
-	b []byte
-}
-
-func (b *allocBuffer) len() int {
-	return len(b.b)
-}
-
-func getBuffer(i int) allocBuffer {
-	return allocBuffer{b: alloc.Get(i)}
-}
-
-func releaseBuffer(b allocBuffer) {
-	alloc.Release(b.b)
-}
 
 var writeResChanPool = sync.Pool{New: func() any {
 	return make(chan writeRes, 1)
@@ -44,13 +28,19 @@ var linkBufferPool = sync.Pool{New: func() any {
 	return new(linkBuffer)
 }}
 
+type linkBuffer struct {
+	bp   *[]byte
+	read int
+	next *linkBuffer
+}
+
 func getLinkBuffer() *linkBuffer {
 	return linkBufferPool.Get().(*linkBuffer)
 }
 
 func releaseLinkBuffer(lb *linkBuffer) {
-	alloc.Release(lb.b)
-	lb.b = nil
+	bytesPool.Release(lb.bp)
+	lb.bp = nil
 	lb.read = 0
 	lb.next = nil
 	linkBufferPool.Put(lb)
