@@ -2,7 +2,6 @@ package mux
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 
 	bytesPool "github.com/IrineSistiana/go-bytes-pool"
@@ -57,9 +56,11 @@ func validWindowSize(i uint32) uint32 {
 }
 
 type idleTimer struct {
-	d    time.Duration
-	t    *time.Timer
-	noop atomic.Bool
+	d time.Duration
+
+	m     sync.Mutex
+	fired bool
+	t     *time.Timer
 }
 
 func newIdleTimer(d time.Duration, f func()) *idleTimer {
@@ -70,15 +71,23 @@ func newIdleTimer(d time.Duration, f func()) *idleTimer {
 }
 
 func (t *idleTimer) reset() {
-	if t.noop.CompareAndSwap(false, true) {
-		if !t.t.Reset(t.d) { // timer was fired, but we re-activated it.
-			t.t.Stop()
-			return // leave noop to true
-		}
-		t.noop.Store(false)
+	t.m.Lock()
+	defer t.m.Unlock()
+
+	if t.fired {
+		return
+	}
+
+	if !t.t.Reset(t.d) { // timer was fired, but we re-activated it.
+		t.t.Stop()
+		t.fired = true
 	}
 }
 
 func (t *idleTimer) stop() {
+	t.m.Lock()
+	defer t.m.Unlock()
+
 	t.t.Stop()
+	t.fired = true
 }
