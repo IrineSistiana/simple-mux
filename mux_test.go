@@ -2,16 +2,17 @@ package mux
 
 import (
 	"bytes"
-	"github.com/stretchr/testify/assert"
 	"io"
 	"math/rand"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
-func pipe() (c *Session, s *Session, err error) {
+func tcpLoopbackPipe() (c *Session, s *Session, err error) {
 	l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		return nil, nil, err
@@ -55,7 +56,7 @@ func Test_Mux_IO(t *testing.T) {
 	junk := make([]byte, 10*1024*1024)
 	rand.Read(junk)
 
-	c, s, err := pipe()
+	c, s, err := tcpLoopbackPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +127,7 @@ func Test_Mux_Ping_Idle_Timeout(t *testing.T) {
 
 	sess2 := NewSession(c2, Opts{
 		AllowAccept:  true,
-		PingInterval: time.Millisecond * 50,
+		PingInterval: time.Millisecond * 200,
 		IdleTimeout:  time.Hour,
 	})
 	go func() {
