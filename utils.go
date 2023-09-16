@@ -2,6 +2,7 @@ package mux
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bytesPool "github.com/IrineSistiana/go-bytes-pool"
@@ -55,22 +56,33 @@ func validWindowSize(i uint32) uint32 {
 	return i
 }
 
-type idleTimer struct {
+type idleControl struct {
 	d time.Duration
 
-	m     sync.Mutex
-	fired bool
-	t     *time.Timer
+	latestResetTimeMs atomic.Int64
+	m                 sync.Mutex
+	fired             bool
+	t                 *time.Timer
 }
 
-func newIdleTimer(d time.Duration, f func()) *idleTimer {
-	return &idleTimer{
+func newIdleTimer(d time.Duration, closeFn func()) *idleControl {
+	return &idleControl{
 		d: d,
-		t: time.AfterFunc(d, f),
+		t: time.AfterFunc(d, closeFn),
 	}
 }
 
-func (t *idleTimer) reset() {
+func (t *idleControl) reset() {
+	const (
+		updateInterval = int64(time.Millisecond * 10)
+	)
+
+	nowMs := time.Now().UnixMilli()
+	if nowMs-t.latestResetTimeMs.Load() < updateInterval {
+		return
+	}
+	t.latestResetTimeMs.Store(nowMs)
+
 	t.m.Lock()
 	defer t.m.Unlock()
 
@@ -84,7 +96,7 @@ func (t *idleTimer) reset() {
 	}
 }
 
-func (t *idleTimer) stop() {
+func (t *idleControl) stop() {
 	t.m.Lock()
 	defer t.m.Unlock()
 

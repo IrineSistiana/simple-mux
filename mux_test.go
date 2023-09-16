@@ -117,7 +117,7 @@ func Test_Mux_IO(t *testing.T) {
 	wg.Wait()
 }
 
-func Test_Mux_Ping_Idle_Timeout(t *testing.T) {
+func Test_Mux_IdleTimeout(t *testing.T) {
 	c1, c2 := net.Pipe()
 	sess := NewSession(c1, Opts{
 		AllowAccept:  false,
@@ -154,7 +154,50 @@ func Test_Mux_Ping_Idle_Timeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(time.Millisecond * 500)
-	if err := sess.CloseErr(); err != ErrIdleTimeout {
+	if err := sess.CloseErr(); err != ErrIdleTimedOut {
 		t.Fatalf("sess should be closed due to idle timed out, got err %v", err)
+	}
+}
+
+func Test_Mux_PingTimeout(t *testing.T) {
+	c1, c2 := net.Pipe()
+	sess := NewSession(c1, Opts{
+		AllowAccept:  false,
+		PingInterval: time.Millisecond * 50,
+		IdleTimeout:  time.Millisecond * 200,
+	})
+
+	sess2 := NewSession(c2, Opts{
+		AllowAccept:  true,
+		PingInterval: time.Millisecond * 200,
+		IdleTimeout:  time.Hour,
+		testNoPong:   true,
+	})
+	go func() {
+		for {
+			sm, err := sess2.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(io.Discard, sm)
+			}()
+		}
+	}()
+	defer func() {
+		_ = sess.Close()
+		_ = sess2.Close()
+	}()
+
+	sm, err := sess.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sm.Write(make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond * 500)
+	if err := sess.CloseErr(); err != ErrPingTimedOut {
+		t.Fatalf("sess should be closed due to ping timed out, got err %v", err)
 	}
 }

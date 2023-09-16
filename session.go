@@ -14,6 +14,8 @@ import (
 
 const (
 	MaxStreamNum = 1<<31 - 1
+
+	defaultPingTimeout = time.Second * 10
 )
 
 var (
@@ -21,8 +23,8 @@ var (
 	ErrStreamIdOverFlowed = errors.New("stream id is overflowed")
 	ErrInvalidSynFrame    = errors.New("invalid syn frame")
 	ErrInvalidSID         = errors.New("invalid stream id")
-	ErrPingTimeout        = errors.New("ping timed out")
-	ErrIdleTimeout        = errors.New("idle timed out")
+	ErrPingTimedOut       = errors.New("ping timed out")
+	ErrIdleTimedOut       = errors.New("idle timed out")
 	ErrAcceptNotAllowed   = errors.New("accept is not allowed")
 	ErrFlowWindowOverflow = errors.New("flow control window overflowed")
 )
@@ -55,6 +57,8 @@ type Opts struct {
 	// ErrIdleTimeout if no data (excluding ping and pong) was transmitted.
 	// Zero value means no idle timeout.
 	IdleTimeout time.Duration
+
+	testNoPong bool
 }
 
 type Session struct {
@@ -63,16 +67,15 @@ type Session struct {
 
 	acceptedChan chan *Stream
 
-	// read loop
-	pingReadMark atomic.Bool // for fast ping check
-
 	// write loop
 	// Once the writeFrameOp was sent to the writeOpChan,
 	// c.Write will be called and the result will be
 	// sent back by writeFrameOp.rc.
 	writeOpChan chan writeFrameOp
 
-	idleTimer *idleTimer // May be nil if idle timeout was not set.
+	// idle control
+	// nil if no idle timeout was set.
+	idleControl *idleControl
 
 	closeNotify chan struct{}
 	closeErr    error // valid after closeNotify was closed.
@@ -96,6 +99,7 @@ type writeFrameOp struct {
 	// Indicate b is an buffer from bytesPool and should be released.
 	releaseB bool
 }
+
 type writeRes struct {
 	n   int
 	err error
@@ -112,16 +116,13 @@ func NewSession(c io.ReadWriteCloser, opts Opts) *Session {
 	}
 
 	if t := opts.IdleTimeout; t > 0 {
-		s.idleTimer = newIdleTimer(t, func() {
-			s.closeWithErr(ErrIdleTimeout)
+		s.idleControl = newIdleTimer(t, func() {
+			s.closeWithErr(ErrIdleTimedOut)
 		})
 	}
 
 	go s.readLoop()
 	go s.writeLoop()
-	if s.opts.PingInterval > 0 {
-		go s.pingLoop()
-	}
 	return s
 }
 
@@ -240,8 +241,8 @@ func (s *Session) closeWithErr(err error) {
 	close(s.closeNotify)
 	_ = s.c.Close()
 
-	if s.idleTimer != nil {
-		s.idleTimer.stop()
+	if s.idleControl != nil {
+		s.idleControl.stop()
 	}
 
 	for _, stream := range s.streams {
@@ -257,12 +258,47 @@ func (r readFunc) Read(p []byte) (n int, err error) {
 
 func (s *Session) readLoop() {
 	br := bufio.NewReaderSize(s.c, 128)
+
+	readNotify := make(chan struct{}, 1)
 	var r readFunc = func(b []byte) (int, error) {
 		n, err := br.Read(b)
 		if n > 0 {
-			s.pingReadMark.Store(true)
+			select {
+			case readNotify <- struct{}{}:
+			default:
+			}
 		}
 		return n, err
+	}
+
+	var pingCheckTimer *time.Timer
+	pingInterval := s.opts.PingInterval
+	if pingInterval > 0 {
+		pingTimeout := s.opts.PingTimeout
+		if pingTimeout <= 0 {
+			pingTimeout = defaultPingTimeout
+		}
+		if pingInterval < pingTimeout {
+			pingTimeout = pingInterval
+		}
+
+		pingCheckTimer = time.AfterFunc(pingInterval, func() {
+			select {
+			case <-readNotify:
+			default:
+			}
+			s.sendFrameBuf(packPingFrame(), true)
+			pingTimeoutTimer := time.NewTimer(pingTimeout)
+			defer pingTimeoutTimer.Stop()
+			select {
+			case <-readNotify:
+				return
+			case <-pingTimeoutTimer.C:
+				s.closeWithErr(ErrPingTimedOut)
+				return
+			}
+		})
+		defer pingCheckTimer.Stop()
 	}
 
 	hb := make([]byte, 1)
@@ -293,6 +329,9 @@ func (s *Session) readLoop() {
 			}
 		case frameTypePing:
 			keepIdle = true
+			if s.opts.testNoPong {
+				break
+			}
 			if err := s.sendFrameBuf(packPongFrame(), true); err != nil {
 				s.closeWithErr(fmt.Errorf("failed to handle PING cmd: %w", err))
 				return
@@ -309,8 +348,11 @@ func (s *Session) readLoop() {
 			return
 		}
 
-		if !keepIdle && s.idleTimer != nil {
-			s.idleTimer.reset()
+		if !keepIdle && s.idleControl != nil {
+			s.idleControl.reset()
+		}
+		if pingCheckTimer != nil {
+			pingCheckTimer.Reset(pingInterval)
 		}
 	}
 }
@@ -468,53 +510,8 @@ func (s *Session) writeLoop() {
 				s.closeWithErr(fmt.Errorf("write loop exited: %w", err))
 				return
 			}
-			if !op.keepIdle && s.idleTimer != nil {
-				s.idleTimer.reset()
-			}
-		case <-s.closeNotify:
-			return
-		}
-	}
-}
-
-func (s *Session) pingLoop() {
-	interval := s.opts.PingInterval
-	timeout := s.opts.PingTimeout
-	if timeout > interval {
-		timeout = interval
-	}
-
-	pingTicker := time.NewTicker(interval)
-	defer pingTicker.Stop()
-	timeoutTimer := time.NewTimer(timeout)
-	defer timeoutTimer.Stop()
-
-	resetTimeoutTimer := func() {
-		if !timeoutTimer.Stop() {
-			select {
-			case <-timeoutTimer.C:
-			default:
-			}
-		}
-		timeoutTimer.Reset(timeout)
-	}
-
-	for {
-		select {
-		case <-pingTicker.C:
-			s.pingReadMark.Store(false)
-			if err := s.sendFrameBuf(packPingFrame(), true); err != nil {
-				return
-			}
-			resetTimeoutTimer()
-			select {
-			case <-timeoutTimer.C:
-				if !s.pingReadMark.Load() { // no data was received after ping being sent.
-					s.closeWithErr(ErrPingTimeout)
-					return
-				}
-			case <-s.closeNotify:
-				return
+			if !op.keepIdle && s.idleControl != nil {
+				s.idleControl.reset()
 			}
 		case <-s.closeNotify:
 			return
