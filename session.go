@@ -8,8 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 )
 
 const (

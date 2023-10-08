@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 	"github.com/stretchr/testify/assert"
 )
 

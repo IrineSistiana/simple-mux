@@ -3,7 +3,7 @@ module github.com/IrineSistiana/simple-mux
 go 1.18
 
 require (
-	github.com/IrineSistiana/go-bytes-pool v0.0.0-20230419012903-2f1f26674686
+	github.com/IrineSistiana/go-bytes-pool v0.0.0-20230918115058-c72bd9761c57
 	github.com/stretchr/testify v1.8.1
 )
 

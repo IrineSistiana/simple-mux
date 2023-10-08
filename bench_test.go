@@ -6,8 +6,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 )
 
 func Benchmark_Mux_Concurrent_IO_Through_Single_TCP(b *testing.B) {
@@ -45,6 +43,7 @@ func Benchmark_Mux_Concurrent_IO_Through_Single_TCP(b *testing.B) {
 			b.Error(err)
 			return
 		}
+
 		buf := bytesPool.Get(16 * 1024)
 		defer bytesPool.Release(buf)
 

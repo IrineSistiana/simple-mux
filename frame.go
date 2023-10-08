@@ -4,8 +4,6 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
-
-	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 )
 
 type frameType uint8

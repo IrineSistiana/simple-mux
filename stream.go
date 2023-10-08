@@ -4,8 +4,6 @@ import (
 	"errors"
 	"io"
 	"sync"
-
-	bytesPool "github.com/IrineSistiana/go-bytes-pool"
 )
 
 const (

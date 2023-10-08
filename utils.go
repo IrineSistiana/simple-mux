@@ -5,8 +5,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	bytesPool "github.com/IrineSistiana/go-bytes-pool"
+	bp "github.com/IrineSistiana/go-bytes-pool"
 )
+
+var bytesPool = bp.NewPool(24)
 
 var writeResChanPool = sync.Pool{New: func() any {
 	return make(chan writeRes, 1)
