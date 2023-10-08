@@ -76,11 +76,11 @@ func newIdleTimer(d time.Duration, closeFn func()) *idleControl {
 
 func (t *idleControl) reset() {
 	const (
-		updateInterval = int64(time.Millisecond * 10)
+		updateIntervalMs = 100
 	)
 
 	nowMs := time.Now().UnixMilli()
-	if nowMs-t.latestResetTimeMs.Load() < updateInterval {
+	if nowMs-t.latestResetTimeMs.Load() < updateIntervalMs {
 		return
 	}
 	t.latestResetTimeMs.Store(nowMs)
