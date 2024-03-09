@@ -1,36 +1,43 @@
 package mux
 
 import (
-	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 const (
-	MaxStreamNum = 1<<31 - 1
+	MaxStreamNum       = 1<<31 - 1
+	InitialStreamQuota = 100
 
-	defaultPingTimeout = time.Second * 10
+	defaultKeepaliveTimeout = time.Second * 10
 )
 
 var (
-	ErrClosedSession      = errors.New("closed session")
-	ErrStreamIdOverFlowed = errors.New("stream id is overflowed")
-	ErrInvalidSynFrame    = errors.New("invalid syn frame")
-	ErrInvalidSID         = errors.New("invalid stream id")
-	ErrPingTimedOut       = errors.New("ping timed out")
-	ErrIdleTimedOut       = errors.New("idle timed out")
-	ErrAcceptNotAllowed   = errors.New("accept is not allowed")
-	ErrFlowWindowOverflow = errors.New("flow control window overflowed")
+	ErrSessionClosed     = errors.New("session closed")
+	ErrSessionEoL        = errors.New("session end of life")
+	ErrStreamQuotaLimit  = errors.New("stream quota limit")
+	ErrTooManyStreams    = errors.New("too many streams")
+	ErrPayloadOverflowed = errors.New("payload size is to large")
+	ErrKeepaliveTimedOut = errors.New("keepalive ping timed out")
+	ErrIdleTimedOut      = errors.New("idle timed out")
+	ErrAcceptNotAllowed  = errors.New("accept is not allowed")
+
+	errInvalidSid             = errors.New("invalid stream id")
+	errDuplicatedSid          = errors.New("duplicated stream id")
+	errStreamQuotaOverFlowed  = errors.New("stream quota overflowed")
+	errNegativeStreamQuotaInc = errors.New("negative stream quota inc")
+	errStreamQuotaViolation   = errors.New("stream quota violation")
 )
 
 type Opts struct {
 	// AllowAccept indicates this Session can accept streams
 	// from peer. If AllowAccept is false and peer sends a SYN
-	// frame, the Session will be closed with ErrInvalidSynFrame.
+	// frame, local will send a FIN frame.
+	// On serve this typically should be true and false on client.
 	AllowAccept bool
 
 	// StreamReceiveWindow sets the default size of receive window when
@@ -38,89 +45,110 @@ type Opts struct {
 	// Minimum rx window size is 64k and maximum is (1<<32 - 1).
 	// If StreamReceiveWindow is invalid, the closest limit will
 	// be used. Which means a zero value is 64k.
-	StreamReceiveWindow uint32
+	StreamReceiveWindow int32
 
-	// PingInterval indicates how long will this Session sends a
-	// ping request to the peer. Zero value means no ping will be sent.
-	PingInterval time.Duration
+	// Write buffer size. Default is about 64k.
+	WriteBufferSize int
 
-	// PingTimeout indicates how long will this Session be closed with
+	// Read buffer size. Default is 64k.
+	ReadBufferSize int
+
+	// KeepaliveInterval indicates how long will this Session sends a
+	// ping request to the peer if no data was received. Zero value means no ping will be sent.
+	KeepaliveInterval time.Duration
+
+	// KeepaliveTimeout indicates how long will this Session be closed with
 	// ErrPingTimeout if no further data (any data, not just a pong) was
-	// received after a ping was sent.
+	// received after a keepalive ping was sent.
 	// Default is 10s.
-	// If PingTimeout > PingInterval, PingInterval will be used.
-	PingTimeout time.Duration
+	KeepaliveTimeout time.Duration
 
 	// IdleTimeout indicates how long will this Session be closed with
-	// ErrIdleTimeout if no data (excluding ping and pong) was transmitted.
+	// ErrIdleTimeout if no stream is alive.
 	// Zero value means no idle timeout.
 	IdleTimeout time.Duration
 
+	// WriteTimeout is the timeout for write op. If a write op started and after
+	// WriteTimeout no data was been written, the connection will be closed.
+	// This requires the connection implementing [SetWriteDeadline(t time.Time) error] method.
+	// See [net.Conn] for more details.
+	WriteTimeout time.Duration
+
+	// The number of concurrent streams that peer can open at a time.
+	// Minimum is initialStreamQuota.
+	MaxConcurrentStreams int32
+
+	// OnClose will be called once when the session is closed.
+	OnClose func(session *Session, err error)
+
+	// Don't send pong back, for ping test.
 	testNoPong bool
+	// Send syn even if no local quota, for quota test.
+	noLocalStreamQuotaLimit bool
+	// Don't update peer stream quota, for quota test.
+	noStreamQuotaUpdate bool
 }
 
 type Session struct {
 	c    io.ReadWriteCloser
 	opts Opts
 
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+
+	frameReader *frameReader // not concurrent safe. Used only in readLoop()
+	frameWriter *frameWriter // concurrent safe.
+
 	acceptedChan chan *Stream
 
-	// write loop
-	// Once the writeFrameOp was sent to the writeOpChan,
-	// c.Write will be called and the result will be
-	// sent back by writeFrameOp.rc.
-	writeOpChan chan writeFrameOp
-
-	// idle control
-	// nil if no idle timeout was set.
-	idleControl *idleControl
-
-	closeNotify chan struct{}
-	closeErr    error // valid after closeNotify was closed.
-
 	// m protects the following fields
-	m          sync.RWMutex
-	closed     atomic.Bool // atomic for fast checks without acquiring m.
-	openedSid  int32
-	reservedId int32
-	streams    map[int32]*Stream // negative id is opened by peer
+	m                sync.RWMutex
+	closed           bool
+	openedSid        int32
+	reserved         int32
+	localStreamQuota int32 // number of streams which we can open
+	peerStreamQuota  int32 // number of streams which peer can open
+
+	streams   map[int32]*Stream // negative id is opened by peer
+	idleTimer *time.Timer       // nil if no idle timeout was set. Reset only if !closed.
+
+	pingCtl   *pingCtl
+	readEvent chan struct{} // for keepalive check
 }
 
-type writeFrameOp struct {
-	b *[]byte
-	// rc is the chan to receive write result.
-	// If set, it must not block (should have at least one buf)
-	rc chan writeRes
-	// If keepIdle, session won't reset its idle timer.
-	// (e.g. this is a PING frame)
-	keepIdle bool
-	// Indicate b is an buffer from bytesPool and should be released.
-	releaseB bool
-}
-
-type writeRes struct {
-	n   int
-	err error
+type SessionStatus struct {
+	Closed           bool
+	OpenedSid        int32
+	Reserved         int32
+	LocalStreamQuota int32
+	PeerStreamQuota  int32
+	ActiveStreams    int
 }
 
 func NewSession(c io.ReadWriteCloser, opts Opts) *Session {
+	ctx, cancel := context.WithCancelCause(context.Background())
 	s := &Session{
-		c:            c,
-		opts:         opts,
-		acceptedChan: make(chan *Stream, 1),
-		writeOpChan:  make(chan writeFrameOp),
-		closeNotify:  make(chan struct{}),
-		streams:      make(map[int32]*Stream),
-	}
+		c:           c,
+		opts:        opts,
+		ctx:         ctx,
+		cancel:      cancel,
+		frameReader: newFrameReader(c, opts.ReadBufferSize),
 
-	if t := opts.IdleTimeout; t > 0 {
-		s.idleControl = newIdleTimer(t, func() {
-			s.closeWithErr(ErrIdleTimedOut)
-		})
+		acceptedChan: make(chan *Stream, 1),
+
+		streams:          make(map[int32]*Stream),
+		localStreamQuota: InitialStreamQuota,
+		peerStreamQuota:  InitialStreamQuota,
+		pingCtl:          newPingCtl(),
+		readEvent:        make(chan struct{}),
+	}
+	s.frameWriter = newFrameWriter(c, opts.WriteBufferSize, s.opts.WriteTimeout)
+
+	if d := opts.IdleTimeout; d > 0 {
+		s.idleTimer = time.AfterFunc(opts.IdleTimeout, s.closeIfIdle)
 	}
 
 	go s.readLoop()
-	go s.writeLoop()
 	return s
 }
 
@@ -130,37 +158,49 @@ func (s *Session) SubConn() io.ReadWriteCloser {
 	return s.c
 }
 
+// Returned [context.Context] will be canceled with the cause error when [Session]
+// is dead.
+func (s *Session) Context() context.Context {
+	return s.ctx
+}
+
 // OpenStream opens a stream.
 // Returns:
 // ErrClosedSession if Session was closed.
 // ErrStreamIdOverFlowed if Session has opened too many streams (see MaxStreamNum).
 // Any error that inner connection returns while sending syn frame.
 func (s *Session) OpenStream() (*Stream, error) {
-	// allocate sid
 	s.m.Lock()
-	if s.Closed() {
+	if s.closed {
 		s.m.Unlock()
-		return nil, ErrClosedSession
+		return nil, ErrSessionClosed
 	}
-	sid, ok := s.openGetNextSidLocked()
-	if !ok {
+
+	if s.openedSid == MaxStreamNum {
 		s.m.Unlock()
-		return nil, ErrStreamIdOverFlowed
+		return nil, ErrSessionEoL
 	}
+
+	if s.localStreamQuota <= 0 && !s.opts.noLocalStreamQuotaLimit {
+		s.m.Unlock()
+		return nil, ErrStreamQuotaLimit
+	}
+	s.openedSid++
+	s.localStreamQuota--
+	if s.reserved > 0 {
+		s.reserved--
+	}
+	sid := s.openedSid
 	stream := newStream(s, sid)
 	s.streams[sid] = stream
 	s.m.Unlock()
 
-	// send SYN and the first window update (if needed)
-	if err := s.sendFrameBuf(packSynFrame(sid), false); err != nil {
-		s.m.Lock()
-		delete(s.streams, sid)
-		s.m.Unlock()
-		stream.closeWithErr(err, true)
-		return nil, err
-	}
+	s.frameWriter.WriteSyn(stream.ID())
 	stream.SetRxWindowSize(validWindowSize(s.opts.StreamReceiveWindow))
 
+	if err := s.frameWriter.Err(); err != nil {
+		return nil, err
+	}
 	return stream, nil
 }
 
@@ -177,385 +217,413 @@ func (s *Session) Accept() (*Stream, error) {
 	select {
 	case sm := <-s.acceptedChan:
 		return sm, nil
-	case <-s.closeNotify:
-		return nil, s.closeErr
+	case <-s.ctx.Done():
+		return nil, context.Cause(s.ctx)
 	}
 }
 
-// ReserveStream reserves a stream id for the next OpenStream call.
-// It returns false if stream id was overflowed. (> MaxStreamNum)
-func (s *Session) ReserveStream() bool {
+// ReserveStreamN tries to reserve N streams for future use.
+// If session reaches the stream id limit, the returned [reserved]
+// will be smaller than n.
+func (s *Session) ReserveStreamN(n int32) (reserved int32) {
+	if n < 0 {
+		panic("negative reserve")
+	}
+
 	s.m.Lock()
 	defer s.m.Unlock()
-	if s.openedSid+s.reservedId == MaxStreamNum {
-		return false
-	}
-	s.reservedId++
-	return true
+
+	eofLimit := MaxStreamNum - s.openedSid - s.reserved
+	reserved = min(eofLimit, n)
+	s.reserved += reserved
+	return reserved
 }
 
-// OngoingStreams reports how many streams are currently in this Session.
-func (s *Session) OngoingStreams() int {
+func (s *Session) Status() SessionStatus {
 	s.m.RLock()
 	defer s.m.RUnlock()
-	return len(s.streams)
+	return SessionStatus{
+		Closed:           s.closed,
+		OpenedSid:        s.openedSid,
+		Reserved:         s.reserved,
+		LocalStreamQuota: s.localStreamQuota,
+		PeerStreamQuota:  s.peerStreamQuota,
+		ActiveStreams:    len(s.streams),
+	}
 }
 
-// Close closes Session and all its Stream-s.
+// Close closes Session and all its Streams. It always returns nil.
 func (s *Session) Close() error {
-	s.closeWithErr(ErrClosedSession)
+	s.close(nil, false)
 	return nil
 }
 
-// Closed reports whether this Session was closed.
-// This is a faster way than checking CloseErr.
-func (s *Session) Closed() bool {
-	return s.closed.Load()
+func (s *Session) CloseWithErr(err error) {
+	s.close(err, false)
 }
 
-// CloseErr returns the error that closes the Session.
-// If Session wasn't closed, it returns nil.
-func (s *Session) CloseErr() error {
-	select {
-	case <-s.closeNotify:
-		return s.closeErr
-	default:
-		return nil
-	}
-}
-
-func (s *Session) closeWithErr(err error) {
+func (s *Session) close(err error, byIdleTimer bool) {
 	if err == nil {
-		err = ErrClosedSession
+		err = ErrSessionClosed
 	}
 
 	s.m.Lock()
-	defer s.m.Unlock()
-	if s.closed.Load() {
+	if s.closed ||
+		(byIdleTimer && len(s.streams) > 0 || s.reserved > 0) { // close if idle
+		s.m.Unlock()
 		return
 	}
-	s.closed.Store(true)
-	s.closeErr = err
-	close(s.closeNotify)
-	_ = s.c.Close()
+	s.closed = true
 
-	if s.idleControl != nil {
-		s.idleControl.stop()
+	if !byIdleTimer {
+		// Don't access idleTimer in this func if it was called by it.
+		if s.idleTimer != nil {
+			s.idleTimer.Stop()
+		}
 	}
 
+	s.cancel(err)
 	for _, stream := range s.streams {
-		stream.closeWithErr(err, true)
+		stream.closeWithErr(err, false)
+	}
+	s.m.Unlock()
+
+	// Call those funcs outside of lock because they may block.
+	s.frameWriter.WriteGoAway(0)
+	s.c.Close()
+	if fn := s.opts.OnClose; fn != nil {
+		fn(s, err)
 	}
 }
 
-type readFunc func([]byte) (int, error)
+// called by s.idleTimer.
+func (s *Session) closeIfIdle() {
+	s.close(ErrIdleTimedOut, true)
+}
 
-func (r readFunc) Read(p []byte) (n int, err error) {
-	return r(p)
+func (s *Session) keepaliveTimeout() time.Duration {
+	if d := s.opts.KeepaliveTimeout; d > 0 {
+		return d
+	}
+	return defaultKeepaliveTimeout
+}
+
+// keepalive sends a keepalive ping.
+// If ping timed out or failed, It closes the connection.
+func (s *Session) keepalive() {
+	ctx, cancel := context.WithTimeoutCause(s.ctx, s.keepaliveTimeout(), ErrKeepaliveTimedOut)
+	defer cancel()
+	err := s.keepalivePing(ctx)
+	if err != nil {
+		s.CloseWithErr(err)
+	}
+}
+
+func (s *Session) sendReadEvent() {
+	select {
+	case s.readEvent <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Session) readLoop() {
-	br := bufio.NewReaderSize(s.c, 128)
-
-	readNotify := make(chan struct{}, 1)
-	var r readFunc = func(b []byte) (int, error) {
-		n, err := br.Read(b)
-		if n > 0 {
-			select {
-			case readNotify <- struct{}{}:
-			default:
-			}
-		}
-		return n, err
+	keepaliveInterval := s.opts.KeepaliveInterval
+	var keepaliveTimer *time.Timer
+	if keepaliveInterval != 0 {
+		keepaliveTimer = time.AfterFunc(keepaliveInterval, s.keepalive)
+		defer keepaliveTimer.Stop()
 	}
 
-	var pingCheckTimer *time.Timer
-	pingInterval := s.opts.PingInterval
-	if pingInterval > 0 {
-		pingTimeout := s.opts.PingTimeout
-		if pingTimeout <= 0 {
-			pingTimeout = defaultPingTimeout
-		}
-		if pingInterval < pingTimeout {
-			pingTimeout = pingInterval
-		}
-
-		pingCheckTimer = time.AfterFunc(pingInterval, func() {
-			select {
-			case <-readNotify:
-			default:
-			}
-			s.sendFrameBuf(packPingFrame(), true)
-			pingTimeoutTimer := time.NewTimer(pingTimeout)
-			defer pingTimeoutTimer.Stop()
-			select {
-			case <-readNotify:
-				return
-			case <-pingTimeoutTimer.C:
-				s.closeWithErr(ErrPingTimedOut)
-				return
-			}
-		})
-		defer pingCheckTimer.Stop()
-	}
-
-	hb := make([]byte, 1)
 	for {
-		if _, err := io.ReadFull(r, hb); err != nil {
-			s.closeWithErr(fmt.Errorf("failed to read header: %w", err))
+		typ, err := s.frameReader.ReadTyp()
+		if err != nil {
+			s.CloseWithErr(fmt.Errorf("failed to read frame type header: %w", err))
 			return
 		}
-		typ := frameType(hb[0])
 
-		keepIdle := false
 		switch typ {
-		case frameTypeSYN:
-			if err := s.handleSYN(r); err != nil {
-				s.closeWithErr(fmt.Errorf("failed to handle syn cmd: %w", err))
+		case frameTypeSyn:
+			if err := s.handleSynFrame(); err != nil {
+				s.CloseWithErr(fmt.Errorf("failed to handle SYN frame: %w", err))
 				return
 			}
-		case frameTypeFIN:
-			if err := s.handleFIN(r); err != nil {
-				s.closeWithErr(fmt.Errorf("failed to handle fin sid: %w", err))
-				return
-			}
-
 		case frameTypeData:
-			if err := s.handleDataFrame(r); err != nil {
-				s.closeWithErr(fmt.Errorf("failed to handle data frame: %w", err))
+			if err := s.handleDataFrame(); err != nil {
+				s.CloseWithErr(fmt.Errorf("failed to handle DATA frame: %w", err))
+				return
+			}
+		case frameTypeFin:
+			if err := s.handleFinFrame(); err != nil {
+				s.CloseWithErr(fmt.Errorf("failed to handle FIN frame: %w", err))
 				return
 			}
 		case frameTypePing:
-			keepIdle = true
-			if s.opts.testNoPong {
-				break
-			}
-			if err := s.sendFrameBuf(packPongFrame(), true); err != nil {
-				s.closeWithErr(fmt.Errorf("failed to handle PING cmd: %w", err))
+			if err := s.handlePingFrame(); err != nil {
+				s.CloseWithErr(fmt.Errorf("failed to handle PING frame: %w", err))
 				return
 			}
 		case frameTypePong:
-			keepIdle = true
+			if err := s.handlePongFrame(); err != nil {
+				s.CloseWithErr(fmt.Errorf("failed to handle PONG frame: %w", err))
+				return
+			}
 		case frameTypeWindowsUpdate:
-			if err := s.handleWindowUpdateFrame(r); err != nil {
-				s.closeWithErr(fmt.Errorf("failed to handle window update cmd: %w", err))
+			if err := s.handleWindowUpdateFrame(); err != nil {
+				s.CloseWithErr(fmt.Errorf("failed to handle window update frame: %w", err))
+				return
+			}
+		case frameTypeGoAway:
+			if err := s.handleGoAwayFrame(); err != nil {
+				s.CloseWithErr(fmt.Errorf("failed to handle go away frame: %w", err))
+				return
+			}
+		case frameTypeStreamQuotaUpdate:
+			if err := s.handleStreamQuotaUpdateFrame(); err != nil {
+				s.CloseWithErr(fmt.Errorf("failed to handle stream quota frame: %w", err))
 				return
 			}
 		default:
-			s.closeWithErr(fmt.Errorf("invalid cmd %d", typ))
+			s.CloseWithErr(fmt.Errorf("invalid frame type %d", typ))
 			return
 		}
 
-		if !keepIdle && s.idleControl != nil {
-			s.idleControl.reset()
+		if keepaliveTimer != nil {
+			keepaliveTimer.Reset(keepaliveInterval)
 		}
-		if pingCheckTimer != nil {
-			pingCheckTimer.Reset(pingInterval)
-		}
+		s.sendReadEvent()
 	}
 }
 
-func (s *Session) handleSYN(r io.Reader) error {
+func (s *Session) handleSynFrame() error {
+	sid, err := s.frameReader.ReadSYN()
+	if err != nil {
+		return err
+	}
+	sid = -sid
+
+	if sid >= 0 { // Peer cannot open positive sid.
+		return errInvalidSid
+	}
+
 	if !s.opts.AllowAccept {
-		return ErrInvalidSynFrame
-	}
-
-	sid, err := readSid(r)
-	if err != nil {
-		return err
-	}
-
-	sid = -sid
-	if sid >= 0 {
-		return ErrInvalidSID
-	}
-
-	sm := newStream(s, sid)
-	s.m.Lock()
-	_, dup := s.streams[sid]
-	if dup { // duplicated sid
-		s.m.Unlock()
-		sm.closeWithErr(ErrInvalidSID, true)
-		return ErrInvalidSID
-	}
-	s.streams[sid] = sm
-	s.m.Unlock()
-	sm.SetRxWindowSize(validWindowSize(s.opts.StreamReceiveWindow))
-
-	select {
-	case s.acceptedChan <- sm:
-	case <-s.closeNotify:
-		return s.closeErr
-	}
-
-	return nil
-}
-
-func (s *Session) handleFIN(r io.Reader) error {
-	sid, err := readSid(r)
-	if err != nil {
-		return err
-	}
-	sid = -sid
-
-	s.m.Lock()
-	sm := s.streams[sid]
-	if sm == nil {
-		// streams has been closed. Nothing to do.
-		s.m.Unlock()
+		s.frameWriter.WriteFin(sid)
 		return nil
 	}
-	delete(s.streams, sid)
+
+	s.m.Lock()
+	if s.peerStreamQuota <= 0 {
+		s.m.Unlock()
+		return errStreamQuotaViolation
+	}
+	s.peerStreamQuota--
+
+	_, dup := s.streams[sid]
+	if dup {
+		s.m.Unlock()
+		return errDuplicatedSid
+	}
+	stream := newStream(s, sid)
+	s.streams[sid] = stream
+	if s.idleTimer != nil && len(s.streams) == 1 {
+		s.idleTimer.Stop()
+	}
+	incPeerStreamQuota := s.incPeerStreamQuotaLocked()
 	s.m.Unlock()
-	sm.closeWithErr(io.EOF, true)
-	return nil
+
+	stream.SetRxWindowSize(validWindowSize(s.opts.StreamReceiveWindow))
+	if incPeerStreamQuota > 0 {
+		s.frameWriter.WriteStreamQuotaUpdate(incPeerStreamQuota)
+	}
+
+	select {
+	case s.acceptedChan <- stream:
+	case <-s.ctx.Done():
+		return context.Cause(s.ctx)
+	}
+	return s.frameWriter.Err()
 }
 
-func (s *Session) handleDataFrame(r io.Reader) error {
-	sid, l, err := readDataHeader(r)
+func (s *Session) incPeerStreamQuotaLocked() int32 {
+	if s.opts.noStreamQuotaUpdate {
+		return 0
+	}
+
+	maxConcurrentStreams := s.opts.MaxConcurrentStreams
+	if maxConcurrentStreams < InitialStreamQuota {
+		maxConcurrentStreams = InitialStreamQuota
+	}
+	if delta := maxConcurrentStreams - s.peerStreamQuota; delta > (maxConcurrentStreams >> 2) {
+		s.peerStreamQuota += delta
+		return delta
+	}
+	return 0
+}
+
+func (s *Session) handleDataFrame() error {
+	sid, l, err := s.frameReader.ReadDataHdr()
 	if err != nil {
 		return err
 	}
 	if l == 0 {
 		return nil
 	}
-	sid = -sid
 
-	b := bytesPool.Get(int(l))
-	n := 0
-	for n < int(l) {
-		nr, err := r.Read((*b)[n:])
-		if nr > 0 {
-			if int(l) == nr { // full read
-				return s.pushData(sid, b)
-			}
-			// partial frame read
-			// push what we have read to the stream asap for lower latency
-			fragment := bytesPool.Get(nr)
-			copy(*fragment, (*b)[n:])
-			if err := s.pushData(sid, fragment); err != nil {
-				bytesPool.Release(b)
-				return err
-			}
-		}
+	sid = -sid
+	s.m.RLock()
+	stream := s.streams[sid]
+	s.m.RUnlock()
+
+	if stream == nil {
+		// No such stream, maybe we closed it first. Just ignore it and discard
+		// its payload.
+		_, err := s.frameReader.DiscardPayload(int(l))
+		return err
+	}
+
+	var n int
+	for n < int(l) { // Read all frame payload
+		_, nr, err := stream.rb.ReadChunk(s.frameReader.r, int(l)-n)
+		n += nr
 		if err != nil {
-			bytesPool.Release(b)
 			return err
 		}
-		n += nr
-	}
-	bytesPool.Release(b)
-	return nil
-}
-
-// pushData will take b's ownership.
-func (s *Session) pushData(sid int32, b *[]byte) error {
-	s.m.RLock()
-	sm := s.streams[sid]
-	s.m.RUnlock()
-	if sm == nil { // stream has been closed.
-		return nil
-	}
-
-	overflowed, closed := sm.rb.pushBuffer(b)
-	if overflowed || closed {
-		bytesPool.Release(b)
-		if overflowed {
-			return ErrFlowWindowOverflow // receive window overflowed is a protocol error
-		}
 	}
 	return nil
 }
 
-func (s *Session) handleWindowUpdateFrame(r io.Reader) error {
-	sid, i, err := readWindowUpdate(r)
+// Removes sid from Session.
+func (s *Session) removeStream(sid int32) *Stream {
+	s.m.Lock()
+	stream := s.streams[sid]
+	if stream != nil {
+		delete(s.streams, sid)
+	}
+	if s.idleTimer != nil && len(s.streams) == 0 && s.reserved == 0 && !s.closed {
+		s.idleTimer.Reset(s.opts.IdleTimeout)
+	}
+	if s.openedSid == MaxStreamNum && len(s.streams) == 0 { // eol
+		defer s.CloseWithErr(ErrSessionEoL) // defer out of the lock
+	}
+	s.m.Unlock()
+	return stream
+}
+
+func (s *Session) handleFinFrame() error {
+	sid, err := s.frameReader.ReadFin()
 	if err != nil {
 		return err
 	}
-	if i > MaxWindow {
-		return ErrFlowWindowOverflow
-	}
 	sid = -sid
 
-	s.m.RLock()
-	sm := s.streams[sid]
-	s.m.RUnlock()
-	if sm == nil {
-		return nil
-	}
-	if ok := sm.flowControl.inc(i); !ok {
-		return fmt.Errorf("cannot increase window size by %d, overflowed", i)
+	stream := s.removeStream(sid)
+	if stream != nil {
+		stream.closeWithErr(io.EOF, false)
 	}
 	return nil
 }
 
-func (s *Session) writeLoop() {
-	for {
-		select {
-		case op := <-s.writeOpChan:
-			n, err := s.c.Write(*op.b)
-			if rc := op.rc; rc != nil {
-				select {
-				case rc <- writeRes{n: n, err: err}:
-				default:
-					panic("rc is blocked")
-				}
-			}
-			if op.releaseB {
-				bytesPool.Release(op.b)
-			}
-			if err != nil {
-				s.closeWithErr(fmt.Errorf("write loop exited: %w", err))
-				return
-			}
-			if !op.keepIdle && s.idleControl != nil {
-				s.idleControl.reset()
-			}
-		case <-s.closeNotify:
-			return
-		}
+func (s *Session) handleWindowUpdateFrame() error {
+	sid, inc, err := s.frameReader.ReadWindowUpdate()
+	if err != nil {
+		return err
 	}
+	sid = -sid
+
+	s.m.RLock()
+	stream := s.streams[sid]
+	s.m.RUnlock()
+	if stream == nil { // No such stream. Ignore it.
+		return nil
+	}
+	if err := stream.tc.IncWindow(inc); err != nil {
+		return err
+	}
+	return nil
 }
 
-// sendFrameBuf takes control of the b. If keepIdle, Session idle timer won't
-// be reset. (e.g. ping)
-func (s *Session) sendFrameBuf(b *[]byte, keepIdle bool) error {
-	rc := getWriteResChan()
-	defer releaseWriteResChan(rc)
-
-	select {
-	case s.writeOpChan <- writeFrameOp{b: b, rc: rc, keepIdle: keepIdle, releaseB: true}:
-		res := <-rc
-		return res.err
-	case <-s.closeNotify:
-		return s.closeErr
+func (s *Session) handlePingFrame() error {
+	id, err := s.frameReader.ReadPing()
+	if err != nil {
+		return err
 	}
+
+	if s.opts.testNoPong {
+		return nil
+	}
+	_, err = s.frameWriter.WritePong(id)
+	return err
 }
 
-// streamCloseNotify must only be called by a stream that belongs to s when
-// the stream is closing not by the session (e.g. user)
-func (s *Session) streamCloseNotify(sid int32) {
-	var sendFin2Peer bool
+func (s *Session) handlePongFrame() error {
+	id, err := s.frameReader.ReadPing()
+	if err != nil {
+		return err
+	}
+	s.pingCtl.Notify(id)
+	return nil
+}
+
+func (s *Session) handleGoAwayFrame() error {
+	_, err := s.frameReader.ReadGoAway() // TODO: Impl error code handling.
+	if err != nil {
+		return err
+	}
+	// Assume that peer go away as EOF for all streams.
+	s.CloseWithErr(io.EOF)
+	return nil
+}
+
+func (s *Session) handleStreamQuotaUpdateFrame() error {
+	inc, err := s.frameReader.ReadStreamQuotaUpdate()
+	if err != nil {
+		return err
+	}
+
+	if inc < 0 {
+		return errNegativeStreamQuotaInc
+	}
+
 	s.m.Lock()
-	// If session received FIN from peer first, this sid will no longer in the session,
-	// We don't have to send FIN back.
-	if _, ok := s.streams[sid]; ok {
-		delete(s.streams, sid)
-		sendFin2Peer = true
+	if n, c := add32(s.localStreamQuota, inc); c > 0 {
+		s.m.Unlock()
+		return errStreamQuotaOverFlowed
+	} else {
+		s.localStreamQuota = n
 	}
 	s.m.Unlock()
-	if sendFin2Peer {
-		_ = s.sendFrameBuf(packFinFrame(sid), false)
+	return nil
+}
+
+func (s *Session) Ping(ctx context.Context) error {
+	id, c := s.pingCtl.Reg()
+	defer s.pingCtl.Del(id)
+
+	_, err := s.frameWriter.WritePing(id)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-c:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
 	}
 }
 
-func (s *Session) openGetNextSidLocked() (int32, bool) {
-	if s.openedSid == MaxStreamNum {
-		return 0, false // overflowed
+func (s *Session) keepalivePing(ctx context.Context) error {
+	id, _ := s.pingCtl.Reg()
+	defer s.pingCtl.Del(id)
+
+	_, err := s.frameWriter.WritePing(id)
+	if err != nil {
+		return err
 	}
-	s.openedSid++
-	if s.reservedId > 0 {
-		s.reservedId--
+
+	select {
+	case <-s.readEvent:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
 	}
-	return s.openedSid, true
 }

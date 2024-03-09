@@ -4,12 +4,10 @@
 
 A simple connection multiplexing library for Golang.
 
-- KISS (keep it simple stupid).
-- Almost Zero-alloc. Still needs to allocate buffers, but they will be reused.
-- Small overhead. Data frame has 7 bytes header and can have 65535 bytes payload.
-- Streams can be opened by either client or server.
-- Builtin flow control and rx buffer for each stream. A slow io stream won't affect other streams in the same session.
-- Builtin session ping&pong for health check and keepalive.
+- Focus on performance. 
+- Bi-directional streams. Streams can also be opened from server side to client.
+- Stream level flow control. Built-in rx buffer.
+- Session level health check and keepalive.
 
 ## Example
 
@@ -56,15 +54,20 @@ func main() {
 
 ## Benchmark
 
+Transfer data concurrently through multiple streams over one tcp loopback connection. 
+
 ```text
-# Sending data through 8 streams concurrently via a single TCP loopback connection.
-Benchmark_Mux_Concurrent_IO_Through_Single_TCP-8           89846             11995 ns/op              1302 Mb/s        2 B/op          0 allocs/op
+Benchmark_Mux/1_streams-8                 335876             16582 ns/op              1885 Mb/s        0 B/op          0 allocs/op
+Benchmark_Mux/8_streams-8                 250275             22085 ns/op              1415 Mb/s        7 B/op          0 allocs/op
+Benchmark_Mux/64_streams-8                276235             21512 ns/op              1453 Mb/s        2 B/op          0 allocs/op
+Benchmark_Mux/512_streams-8               237309             21215 ns/op              1473 Mb/s        2 B/op          0 allocs/op
+Benchmark_Mux/2048_streams-8              266313             21881 ns/op              1428 Mb/s       14 B/op          0 allocs/op
+Benchmark_Mux/8196_streams-8              252049             22783 ns/op              1372 Mb/s       39 B/op          0 allocs/op
 
-# Sending data directly through a TCP loopback connection.
-Benchmark_IO_Through_Single_TCP-8                         125737              8676 ns/op              1799 Mb/s        0 B/op          0 allocs/op
+```
 
-# Single cpu
-Benchmark_Mux_Concurrent_IO_Through_Single_TCP     47194             25205 ns/op               619.6 Mb/s              1 B/op             0 allocs/op
-Benchmark_IO_Through_Single_TCP                    56523             18854 ns/op               828.6 Mb/s              0 B/op             0 allocs/op
-PASS
+Baseline: Transfer data directly through one tcp loopback connection. 
+
+```text
+Benchmark_TCP-8                           395679             14765 ns/op              2116 Mb/s        0 B/op          0 allocs/op
 ```
